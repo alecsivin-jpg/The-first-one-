@@ -67,6 +67,11 @@ def white_mask(rgb_small, k=2):
             keep[i] = True
     # white numbers on the opponents' dark jerseys are small blobs; a white jersey is
     # a big one. Drop anything much smaller than the biggest white body in frame.
+    # floodlights / sun glare: clipped-bright blobs high in the frame are not players
+    for i in np.nonzero(keep)[0]:
+        x, y, w, h, a = st[i]
+        if y + h / 2 < 0.42 * m.shape[0] and v[lab == i].mean() > 235:
+            keep[i] = False
     if keep.any():
         biggest = st[keep, 4].max()
         keep &= st[:, 4] >= max(3 * k * k, 0.2 * biggest)
@@ -128,7 +133,7 @@ def smooth(x, k):
 
 
 # ======================================================================= plan
-def build_plan(an, beats, src_dur, mode):
+def build_plan(an, beats, src_dur, mode, joins=()):
     t = np.array(an["t"])
     mot = np.array(an["motion"])
     hm = np.array(an["hero_motion"])
@@ -145,6 +150,8 @@ def build_plan(an, beats, src_dur, mode):
     jump = np.maximum(0, act - smooth(act, 12))
     score = (0.6 * act + jump) * (0.35 + np.clip(whn, 0, 1)) * (pan < np.percentile(pan, 97))
     valid = (t > 1.0) & (t < src_dur - 1.5)
+    for j in joins:  # never pick a moment whose source window crosses a clip join
+        valid &= (t < j - 1.8) | (t > j + 0.5)
     score = np.where(valid, score, 0)
 
     def center(ts, span=0.8):
@@ -760,6 +767,7 @@ def main():
     ap.add_argument("--plan", help="re-render from an edited plan.json instead of auto-picking")
     ap.add_argument("--mode", default="auto", choices=["auto", "day", "night"])
     ap.add_argument("--workdir", default=".")
+    ap.add_argument("--joins", help="comma-separated times where source clips were joined")
     ap.add_argument("--only", type=int, help="render only this clip index (preview)")
     args = ap.parse_args()
 
@@ -770,7 +778,8 @@ def main():
         plan = json.load(open(args.plan))
     else:
         an = analyze(args.source, os.path.join(args.workdir, "analysis.json"))
-        plan = build_plan(an, beats, src.dur, args.mode)
+        joins = [float(x) for x in args.joins.split(",")] if args.joins else []
+        plan = build_plan(an, beats, src.dur, args.mode, joins)
         for c in plan["clips"]:
             if c["kind"] in ("impact", "final"):
                 c["src"] = round(refine_contact(args.source, c["src"]), 3)
