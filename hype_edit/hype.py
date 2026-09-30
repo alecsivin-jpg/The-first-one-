@@ -31,15 +31,57 @@ import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 
 FFMPEG = imageio_ffmpeg.get_ffmpeg_exe()
-OW, OH = 1080, 1920
+# output size: 1080x1920 vertical by default, HYPE_SIZE=1920x1080 for widescreen
+OW, OH = (int(v) for v in os.environ.get("HYPE_SIZE", "1080x1920").split("x"))
 FPS = 30
-LW, LH = 270, 480  # low-res working size for fire/particles/masks
+LW, LH = OW // 4, OH // 4  # low-res working size for fire/particles/masks
 FONT = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
 rng = np.random.default_rng(928)
 
 
 def log(*a):
     print(*a, file=sys.stderr, flush=True)
+
+
+# ============================================================ hero detection
+_yolo = None
+
+
+def white_players(rgb, weights):
+    """Full-res mask of people wearing white/light shirts (the heroes).
+
+    A person-segmentation model finds every player; each one's torso is then checked:
+    mostly bright + unsaturated = white shirt. Black shirts and the ref's stripes fail.
+    """
+    global _yolo
+    if _yolo is None:
+        from ultralytics import YOLO
+        _yolo = YOLO(weights)
+    H, W = rgb.shape[:2]
+    r = _yolo.predict(np.ascontiguousarray(rgb[..., ::-1]), imgsz=1280, conf=0.15, classes=[0],
+                      verbose=False, retina_masks=True)[0]
+    out = np.zeros((H, W), np.float32)
+    if r.masks is None:
+        return out
+    hsv = cv2.cvtColor(rgb, cv2.COLOR_RGB2HSV)
+    gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY).astype(np.float32)
+    for mk, box in zip(r.masks.data.cpu().numpy(), r.boxes.xyxy.cpu().numpy()):
+        mk = cv2.resize(mk, (W, H)) > 0.5
+        x0, y0, x1, y1 = box.astype(int)
+        h = y1 - y0
+        torso = np.zeros_like(mk)
+        torso[y0 + int(0.18 * h): y0 + int(0.5 * h), x0:x1] = True
+        t = mk & torso
+        if t.sum() < 30:
+            continue
+        s, v = hsv[..., 1][t].astype(np.float32), hsv[..., 2][t].astype(np.float32)
+        # sunset light tints white shirts warm, so allow some saturation; brightness is the key
+        whitish = ((v > 150) & (s < 125)).mean()
+        darkish = (v < 120).mean()  # ref stripes / black shirts always have dark pixels
+        stripes = np.abs(np.diff(gray, axis=1, append=0))[t].mean()
+        if whitish > 0.45 and darkish < 0.12 and stripes < 6:
+            out[mk] = 1.0
+    return out
 
 
 # =================================================================== analysis
@@ -70,7 +112,8 @@ def white_mask(rgb_small, k=2):
     # floodlights / sun glare: clipped-bright blobs high in the frame are not players
     for i in np.nonzero(keep)[0]:
         x, y, w, h, a = st[i]
-        if y + h / 2 < 0.42 * m.shape[0] and v[lab == i].mean() > 235:
+        cy = (y + h / 2) / m.shape[0]
+        if cy < 0.3 or (cy < 0.5 and v[lab == i].mean() > 225):  # stadium lights / sky glare
             keep[i] = False
     if keep.any():
         biggest = st[keep, 4].max()
@@ -336,7 +379,7 @@ FIRE = fire_lut()
 GX, GY = np.meshgrid(np.arange(OW, dtype=np.float32), np.arange(OH, dtype=np.float32))
 LX, LY = np.meshgrid(np.arange(LW, dtype=np.float32), np.arange(LH, dtype=np.float32))
 VIG = np.clip(1.25 - 0.95 * (((GX - OW / 2) / (OW * 0.62)) ** 2 + ((GY - OH / 2) / (OH * 0.6)) ** 2),
-              0.25, 1)[..., None].astype(np.float32)
+              0.45, 1)[..., None].astype(np.float32)
 
 
 def screen(a, b):
@@ -468,17 +511,21 @@ def text_layer(text, size, glow=True):
 
 # ===================================================================== render
 class Renderer:
-    def __init__(self, src, plan, beats):
+    def __init__(self, src, plan, beats, seg=None):
+        self.seg = seg
         self.src = src
         self.plan = plan
         self.beats = beats
         self.night = plan["mode"] == "night"
         self.beat_frames = {int(round(b * FPS)) for b in beats["beats"] if b >= beats["drop"]}
-        self.title = text_layer("9.28", 330)
 
     def hero_masks(self, frame):
-        small = cv2.resize(frame, (LW, LH), interpolation=cv2.INTER_AREA)
-        m = white_mask(small, 3).astype(np.float32)
+        if self.seg:
+            m = (cv2.resize(white_players(frame, self.seg), (LW, LH), interpolation=cv2.INTER_AREA) > 0.35
+                 ).astype(np.float32)
+        else:
+            small = cv2.resize(frame, (LW, LH), interpolation=cv2.INTER_AREA)
+            m = white_mask(small, 3).astype(np.float32)
         aura = cv2.GaussianBlur(cv2.dilate(m, np.ones((9, 9), np.uint8)), (0, 0), 7)
         aura = np.clip(aura * 2.2, 0, 1)
         edge = np.clip(cv2.dilate(m, np.ones((3, 3), np.uint8)) - cv2.erode(m, np.ones((3, 3), np.uint8)), 0, 1)
@@ -497,7 +544,7 @@ class Renderer:
         c = c + sh * np.float32([-0.05, 0.035, 0.07]) + hi * np.float32([0.08, 0.02, -0.07])
         # background: desaturate, darken, cool
         gray = (c @ np.float32([0.299, 0.587, 0.114]))[..., None]
-        bg = (0.45 * c + 0.55 * gray) * np.float32([0.62, 0.74, 0.88]) * (0.5 if calm else 0.58)
+        bg = (0.45 * c + 0.55 * gray) * np.float32([0.62, 0.74, 0.88]) * (0.62 if calm else 0.72)
         hero = np.clip(c * np.float32([1.1, 1.02, 0.94]) * 1.06 + 0.02, 0, 1)
         a = aura_full[..., None]
         return np.clip(bg * (1 - a) + hero * a, 0, 1)
@@ -513,9 +560,8 @@ class Renderer:
                 layer += beam * 0.35 * flick
             col = np.float32([0.85, 0.92, 1.0])
         else:
-            r2 = ((LX - LW * 0.15) ** 2 + (LY - LH * 0.08) ** 2) / (LW * 0.6) ** 2
-            layer = np.exp(-r2 * 3) * 0.6 + np.exp(-((LY - LH * 0.08) / 4) ** 2) * 0.15
-            col = np.float32([1.0, 0.72, 0.38])
+            layer = np.zeros((LH, LW), np.float32)
+            col = np.float32([0.8, 0.86, 0.95])
         haze = NOISE.at(f, 2)[0] * 0.03 + 0.04
         layer = layer + haze * np.exp(-LY / LH * 2)
         return up(np.clip(layer, 0, 1))[..., None] * col * (0.7 if calm else 1.0)
@@ -524,11 +570,9 @@ class Renderer:
         kind = clip["kind"]
         n = int(round(clip["dur"] * FPS))
         start_f = int(round(clip["start"] * FPS))
-        if kind == "title":
-            col, a = self.title
+        if kind == "title":  # the silent beat before the drop: hard black
             for i in range(n):
-                s = 0.35 + 0.65 * (i % 2)  # flicker
-                enc.write(self.post(col * s, i, start_f + i, {}))
+                enc.write(self.post(np.zeros((OH, OW, 3), np.float32), i, start_f + i, {}))
             return
 
         # --- source time mapping
@@ -560,7 +604,11 @@ class Renderer:
             fi = (times[i] - t0) * self.src.fps
             base = interp(frames, fi) if kind in ("impact", "build") else frames[int(np.clip(round(fi), 0, len(frames) - 1))]
             img = base.astype(np.float32) / 255
-            m, aura, edge = self.hero_masks(base)
+            m_raw, aura, _ = self.hero_masks(base)
+            ema = m_raw if i == 0 else 0.55 * ema + 0.45 * m_raw
+            m = (ema > 0.6).astype(np.float32) * m_raw
+            k3 = np.ones((3, 3), np.uint8)
+            edge = np.clip(cv2.dilate(m, k3) - cv2.erode(m, k3), 0, 1)
 
             since = i - impact_f if impact_f is not None and i >= impact_f else None
             pre = impact_f is not None and i < impact_f
@@ -692,14 +740,6 @@ class Renderer:
             img = cv2.warpAffine(img, M, (OW, OH), borderMode=cv2.BORDER_REFLECT)
 
             if kind == "final":
-                col, a = self.title
-                appear = i - 4
-                if appear >= 0:
-                    s = 1.35 - 0.35 * min(1, appear / 4)
-                    Mt = cv2.getRotationMatrix2D((OW / 2, OH * 0.5), 0, s)
-                    ct = cv2.warpAffine(col, Mt, (OW, OH))
-                    at = cv2.warpAffine(a, Mt, (OW, OH))[..., None]
-                    img = screen(img * (1 - at * 0.6), ct)
                 fade_start = n - int(0.9 * FPS)
                 if i > fade_start:
                     img = img * (1 - (i - fade_start) / (n - fade_start))
@@ -767,6 +807,7 @@ def main():
     ap.add_argument("--plan", help="re-render from an edited plan.json instead of auto-picking")
     ap.add_argument("--mode", default="auto", choices=["auto", "day", "night"])
     ap.add_argument("--workdir", default=".")
+    ap.add_argument("--seg", help="YOLOv8 segmentation weights (e.g. yolov8s-seg.pt) for exact hero masks")
     ap.add_argument("--joins", help="comma-separated times where source clips were joined")
     ap.add_argument("--only", type=int, help="render only this clip index (preview)")
     args = ap.parse_args()
@@ -792,7 +833,7 @@ def main():
 
     silent = os.path.join(args.workdir, "video_only.mp4")
     enc = Encoder(silent)
-    r = Renderer(src, plan, beats)
+    r = Renderer(src, plan, beats, args.seg)
     for k, clip in enumerate(plan["clips"]):
         if args.only is not None and k != args.only:
             continue
