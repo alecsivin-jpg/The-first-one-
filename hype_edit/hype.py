@@ -65,6 +65,11 @@ def white_mask(rgb_small, k=2):
         fill = a / float(w * h)
         if 4 <= a <= area_max and fill > 0.3 and min(w, h) >= k and 0.25 < h / max(w, 1) < 5:
             keep[i] = True
+    # white numbers on the opponents' dark jerseys are small blobs; a white jersey is
+    # a big one. Drop anything much smaller than the biggest white body in frame.
+    if keep.any():
+        biggest = st[keep, 4].max()
+        keep &= st[:, 4] >= max(3 * k * k, 0.2 * biggest)
     return keep[lab].astype(np.uint8)
 
 
@@ -708,7 +713,7 @@ class Renderer:
         fl = fx.get("flash", 0)
         if fl:
             out = out * (1 - fl) + fl
-        grain = rng.normal(0, 0.028, (OH // 2, OW // 2)).astype(np.float32)
+        grain = rng.normal(0, 0.02, (OH // 2, OW // 2)).astype(np.float32)
         out = out + up(grain)[..., None]
         return (np.clip(out, 0, 1) * 255).astype(np.uint8)
 
@@ -718,7 +723,7 @@ class Encoder:
         self.p = subprocess.Popen(
             [FFMPEG, "-y", "-loglevel", "error", "-f", "rawvideo", "-pix_fmt", "rgb24",
              "-s", f"{OW}x{OH}", "-r", str(FPS), "-i", "-", "-c:v", "libx264", "-preset", "medium",
-             "-crf", "17", "-pix_fmt", "yuv420p", path], stdin=subprocess.PIPE)
+             "-crf", "20", "-maxrate", "18M", "-bufsize", "36M", "-pix_fmt", "yuv420p", path], stdin=subprocess.PIPE)
         self.n = 0
 
     def write(self, frame):
